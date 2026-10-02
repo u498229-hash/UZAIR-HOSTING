@@ -500,6 +500,31 @@ def handle_stopbot_cb(call):
         print(f"[stopbot] error: {e}", flush=True)
 
 
+def _ensure_python_venv(bot_dir: Path) -> Path:
+    """Return a working python executable for this bot, recreating the venv
+    (and reinstalling from requirements.txt if present) if it's missing/broken."""
+    venv_dir = bot_dir / "venv"
+    venv_py = venv_dir / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
+
+    if venv_py.exists():
+        return venv_py
+
+    # venv missing (e.g. host wiped local disk on redeploy/restart) -> rebuild it
+    print(f"[venv] missing at {venv_py}, rebuilding…", flush=True)
+    subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
+    req_path = bot_dir / "requirements.txt"
+    if req_path.exists():
+        pip_bin = venv_dir / ("Scripts" if os.name == "nt" else "bin") / ("pip.exe" if os.name == "nt" else "pip")
+        packages = [l.strip() for l in req_path.read_text(errors="ignore").splitlines()
+                    if l.strip() and not l.strip().startswith("#")]
+        if packages:
+            subprocess.run([str(pip_bin), "install", "--upgrade", "--quiet", *packages], check=True)
+
+    if not venv_py.exists():
+        raise FileNotFoundError(f"venv rebuild failed, python not found at {venv_py}")
+    return venv_py
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("startbot_"))
 def handle_startbot_cb(call):
     try:
@@ -512,19 +537,33 @@ def handle_startbot_cb(call):
             return
 
         bot_dir = Path(b["dir"])
+        if not bot_dir.exists():
+            bot.answer_callback_query(call.id, "Bot files missing on server — dobara upload karo.", show_alert=True)
+            return
+
         runtime = b.get("runtime", "python")
         if runtime == "node":
-            proc = subprocess.Popen(["node", "index.js"], cwd=str(bot_dir),
+            if not (bot_dir / "node_modules").exists() and (bot_dir / "package.json").exists():
+                subprocess.run(["npm", "install", "--quiet"], cwd=str(bot_dir), check=True)
+            pkg = json.loads((bot_dir / "package.json").read_text()) if (bot_dir / "package.json").exists() else {}
+            entry = bot_dir / pkg.get("main", "index.js")
+            if not entry.exists():
+                js_files = list(bot_dir.glob("*.js"))
+                entry = js_files[0] if js_files else entry
+            proc = subprocess.Popen(["node", str(entry)], cwd=str(bot_dir),
                                      stdout=open(bot_dir / "out.log", "a"), stderr=subprocess.STDOUT)
         else:
-            venv_py = bot_dir / "venv" / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python")
             entry = bot_dir / "main.py"
             if not entry.exists():
                 for cand in ("app.py", "bot.py", "run.py"):
                     if (bot_dir / cand).exists():
                         entry = bot_dir / cand
                         break
-            proc = subprocess.Popen([str(venv_py) if venv_py.exists() else sys.executable, str(entry)],
+            if not entry.exists():
+                py_files = list(bot_dir.rglob("*.py"))
+                entry = py_files[0] if py_files else entry
+            venv_py = _ensure_python_venv(bot_dir)
+            proc = subprocess.Popen([str(venv_py), str(entry)],
                                      cwd=str(bot_dir), stdout=open(bot_dir / "out.log", "a"), stderr=subprocess.STDOUT)
         RUNNING[bid] = proc
         b["status"] = "running"
@@ -534,7 +573,7 @@ def handle_startbot_cb(call):
         handle_mybot_detail_cb(call)
     except Exception as e:
         print(f"[startbot] error: {e}", flush=True)
-        bot.answer_callback_query(call.id, f"Error: {e}")
+        bot.answer_callback_query(call.id, f"Error: {e}", show_alert=True)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("mydelbot_"))
